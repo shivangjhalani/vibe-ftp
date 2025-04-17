@@ -72,7 +72,9 @@ make all
 - Server responds with standard FTP-style codes: 2xx on success, 4xx/5xx on errors.
 
 **Data Connection (TCP) – Passive Mode Only**
-1. For UP/DOWN, server opens an ephemeral data port and replies with `227 <port>`.
-2. Client connects to server on the data port.
-3. Raw file bytes are transferred in fixed-size buffers (e.g., 4 KB).
+1. For UP/DOWN/SLS, server opens a listening socket on a port within a pre-defined range (e.g., 50000-50099) and replies with `227 Entering Passive Mode (h1,h2,h3,h4,p1,p2)` indicating the chosen IP and port.
+2. Client connects to the server on the specified data port.
+3. Raw file bytes or directory listing are transferred over the data connection.
 4. Both sides close the data connection; control connection remains open.
+
+**Important Firewall Note:** You must ensure the passive port range (e.g., TCP ports 50000-50099) is allowed through the server's firewall for data transfers (UP/DOWN/SLS) to work.

@@ -11,11 +11,14 @@
 #include <fcntl.h> // For file operations (O_RDONLY, O_WRONLY, etc.)
 #include <signal.h> // For signal handling
 #include <sys/time.h> // For timeval struct
+#include <time.h> // For srand
 
 #define BUFFER_SIZE 4096 // Increased buffer for file transfer
 #define DEFAULT_PORT 2121
 #define MAX_PATH_LEN (BUFFER_SIZE - 128) // Increased reserve space
 #define SOCKET_TIMEOUT_SEC 60 // Timeout for send/recv in seconds
+#define PASSIVE_PORT_START 50000 // Define the start of the passive port range
+#define PASSIVE_PORT_END 50099   // Define the end of the passive port range (100 ports)
 
 // Global variable for server socket descriptor (for signal handler)
 int g_server_fd = -1;
@@ -63,42 +66,68 @@ int is_path_valid(const char *path) {
 }
 
 // Helper function to create a listening socket for passive mode data transfers
-// Binds to an ephemeral port and returns the listener FD and the port number.
+// Binds to a port within the defined range [PASSIVE_PORT_START, PASSIVE_PORT_END]
+// Returns the listener FD and the port number.
 int setup_passive_listener(int *port) {
-    int listener_fd;
+    int listener_fd = -1;
     struct sockaddr_in addr;
     socklen_t addrlen = sizeof(addr);
     int opt = 1;
+    int current_port;
+    int bind_success = 0;
 
-    if ((listener_fd = socket(AF_INET, SOCK_STREAM, 0)) == 0) {
-        perror("passive socket failed");
+    // Seed random number generator (optional, for starting port randomization)
+    // srand(time(NULL));
+    // int start_offset = rand() % (PASSIVE_PORT_END - PASSIVE_PORT_START + 1);
+
+    for (int i = 0; i <= (PASSIVE_PORT_END - PASSIVE_PORT_START); ++i) {
+        // current_port = PASSIVE_PORT_START + (start_offset + i) % (PASSIVE_PORT_END - PASSIVE_PORT_START + 1);
+        current_port = PASSIVE_PORT_START + i; // Simple sequential try
+
+        if ((listener_fd = socket(AF_INET, SOCK_STREAM, 0)) < 0) {
+            perror("passive socket creation failed");
+            return -1; // Critical error, stop trying
+        }
+
+        // Allow reuse of local addresses
+        if (setsockopt(listener_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt))) {
+            perror("passive setsockopt SO_REUSEADDR failed");
+            close(listener_fd);
+            listener_fd = -1;
+            continue; // Try next port
+        }
+
+        addr.sin_family = AF_INET;
+        addr.sin_addr.s_addr = INADDR_ANY;
+        addr.sin_port = htons(current_port); // Try specific port
+
+        if (bind(listener_fd, (struct sockaddr *)&addr, sizeof(addr)) == 0) {
+            // Bind successful!
+            *port = current_port;
+            bind_success = 1;
+            break; // Exit the loop
+        } else {
+            // Bind failed (likely EADDRINUSE), close socket and try next port
+            if (errno != EADDRINUSE) {
+                 perror("passive bind failed (non-EADDRINUSE)");
+            }
+            close(listener_fd);
+            listener_fd = -1;
+        }
+    }
+
+    if (!bind_success) {
+        fprintf(stderr, "Failed to bind to any port in the range %d-%d\n", PASSIVE_PORT_START, PASSIVE_PORT_END);
         return -1;
     }
 
-    // Allow reuse of local addresses, useful for quick restarts
-    if (setsockopt(listener_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt))) {
-        perror("passive setsockopt failed");
-        close(listener_fd);
-        return -1;
-    }
-
-    addr.sin_family = AF_INET;
-    addr.sin_addr.s_addr = INADDR_ANY; // Listen on all interfaces
-    addr.sin_port = 0; // Request ephemeral port
-
-    if (bind(listener_fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
-        perror("passive bind failed");
-        close(listener_fd);
-        return -1;
-    }
-
-    // Get the assigned port
+    // Get the assigned port info again (optional, confirms bind)
     if (getsockname(listener_fd, (struct sockaddr *)&addr, &addrlen) < 0) {
-        perror("getsockname failed");
+        perror("getsockname failed after successful bind");
         close(listener_fd);
         return -1;
     }
-    *port = ntohs(addr.sin_port);
+    // *port = ntohs(addr.sin_port); // Should match current_port
 
     if (listen(listener_fd, 1) < 0) { // Listen for one connection
         perror("passive listen failed");

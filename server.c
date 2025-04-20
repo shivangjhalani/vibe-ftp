@@ -12,6 +12,7 @@
 #include <signal.h> // For signal handling
 #include <sys/time.h> // For timeval struct
 #include <time.h> // For srand
+#include <stdbool.h> // For bool type
 
 #define BUFFER_SIZE 4096 // Increased buffer for file transfer
 #define DEFAULT_PORT 2121
@@ -22,6 +23,8 @@
 
 // Global variable for server socket descriptor (for signal handler)
 int g_server_fd = -1;
+// Global variable to store the public IP address if provided
+char* g_public_ip = NULL;
 
 // Signal handler for SIGINT/SIGTERM
 // Attempts to gracefully close the listening socket before exiting.
@@ -139,24 +142,20 @@ int setup_passive_listener(int *port) {
     return listener_fd;
 }
 
-// Helper function to get local IP address for the PASV response
-// Tries to get the address associated with the control socket.
-// Returns IP formatted with commas (e.g., "127,0,0,1").
-char* get_local_ip(int control_socket) {
+// Helper function to get local IP address associated with the control socket.
+// Returns IP in standard dotted-decimal format (e.g., "127.0.0.1").
+char* get_local_interface_ip(int control_socket) {
     struct sockaddr_in local_addr;
     socklen_t addr_len = sizeof(local_addr);
     if (getsockname(control_socket, (struct sockaddr*)&local_addr, &addr_len) == -1) {
         perror("getsockname for local IP failed");
-        return "127,0,0,1"; // Fallback
+        // Return a static buffer for safety, inet_ntoa might use a static buffer too
+        static char fallback_ip[] = "127.0.0.1";
+        return fallback_ip;
     }
-    // Convert to dotted decimal, then replace dots with commas
-    char* ip_str = inet_ntoa(local_addr.sin_addr);
-    for (char *p = ip_str; *p; ++p) {
-        if (*p == '.') {
-            *p = ',';
-        }
-    }
-    return ip_str;
+    // inet_ntoa returns a pointer to a static buffer, which is fine here
+    // as we expect the caller to use it immediately.
+    return inet_ntoa(local_addr.sin_addr);
 }
 
 // Main function to handle a single client connection
@@ -294,11 +293,25 @@ void handle_client(int client_socket) {
                 continue;
             }
 
-            // Format 227 response
-            char *local_ip = get_local_ip(client_socket);
+            // Determine IP for PASV response
+            char *ip_for_pasv = g_public_ip; // Use public IP if provided
+            if (ip_for_pasv == NULL) {
+                ip_for_pasv = get_local_interface_ip(client_socket); // Otherwise, get local interface IP
+            }
+
+            // Format 227 response - IMPORTANT: Replace dots with commas for FTP PASV format
+            char pasv_ip_formatted[INET_ADDRSTRLEN + 1]; // Max length for IPv4 + null terminator
+            strncpy(pasv_ip_formatted, ip_for_pasv, sizeof(pasv_ip_formatted) - 1);
+            pasv_ip_formatted[sizeof(pasv_ip_formatted) - 1] = '\0'; // Ensure null termination
+            for (char *p = pasv_ip_formatted; *p; ++p) {
+                if (*p == '.') {
+                    *p = ',';
+                }
+            }
+
             int p1 = data_port / 256;
             int p2 = data_port % 256;
-            snprintf(response, sizeof(response), "227 Entering Passive Mode (%s,%d,%d)\r\n", local_ip, p1, p2);
+            snprintf(response, sizeof(response), "227 Entering Passive Mode (%s,%d,%d)\r\n", pasv_ip_formatted, p1, p2);
             send(client_socket, response, strlen(response), 0);
 
             // Accept data connection (blocking)
@@ -392,11 +405,25 @@ void handle_client(int client_socket) {
                 continue;
             }
 
-            // Format 227 response
-            char *local_ip = get_local_ip(client_socket);
+            // Determine IP for PASV response
+            char *ip_for_pasv = g_public_ip; // Use public IP if provided
+            if (ip_for_pasv == NULL) {
+                ip_for_pasv = get_local_interface_ip(client_socket); // Otherwise, get local interface IP
+            }
+
+            // Format 227 response - IMPORTANT: Replace dots with commas for FTP PASV format
+            char pasv_ip_formatted[INET_ADDRSTRLEN + 1]; // Max length for IPv4 + null terminator
+            strncpy(pasv_ip_formatted, ip_for_pasv, sizeof(pasv_ip_formatted) - 1);
+            pasv_ip_formatted[sizeof(pasv_ip_formatted) - 1] = '\0'; // Ensure null termination
+            for (char *p = pasv_ip_formatted; *p; ++p) {
+                if (*p == '.') {
+                    *p = ',';
+                }
+            }
+
             int p1 = data_port / 256;
             int p2 = data_port % 256;
-            snprintf(response, sizeof(response), "227 Entering Passive Mode (%s,%d,%d)\r\n", local_ip, p1, p2);
+            snprintf(response, sizeof(response), "227 Entering Passive Mode (%s,%d,%d)\r\n", pasv_ip_formatted, p1, p2);
             send(client_socket, response, strlen(response), 0);
 
             // Accept data connection (blocking)
@@ -509,21 +536,47 @@ int main(int argc, char *argv[]) {
     int opt = 1;
     int addrlen = sizeof(address);
     int port = DEFAULT_PORT;
+    bool port_set = false;
 
     // Setup signal handling for graceful shutdown
     signal(SIGINT, handle_signal);
     signal(SIGTERM, handle_signal);
 
-    if (argc > 1) {
-        port = atoi(argv[1]);
-        if (port <= 0 || port > 65535) {
-            fprintf(stderr, "Invalid port number: %s\n", argv[1]);
-            return 1;
+    // Parse command line arguments
+    for (int i = 1; i < argc; ++i) {
+        if (strcmp(argv[i], "--public-ip") == 0) {
+            if (i + 1 < argc) {
+                g_public_ip = argv[i + 1];
+                // Basic validation: check if it contains dots (not a robust check)
+                if (strchr(g_public_ip, '.') == NULL) {
+                     fprintf(stderr, "Error: Invalid public IP address format: %s\n", g_public_ip);
+                     fprintf(stderr, "Usage: %s [<port>] [--public-ip <ip_address>]\n", argv[0]);
+                     return 1;
+                }
+                printf("Using public IP for PASV: %s\n", g_public_ip);
+                i++; // Skip the next argument (the IP address)
+            } else {
+                fprintf(stderr, "Error: --public-ip requires an argument.\n");
+                fprintf(stderr, "Usage: %s [<port>] [--public-ip <ip_address>]\n", argv[0]);
+                return 1;
+            }
+        } else if (!port_set) {
+            // Assume the first non-option argument is the port
+            port = atoi(argv[i]);
+            if (port <= 0 || port > 65535) {
+                fprintf(stderr, "Invalid port number: %s\n", argv[i]);
+                fprintf(stderr, "Usage: %s [<port>] [--public-ip <ip_address>]\n", argv[0]);
+                return 1;
+            }
+            port_set = true;
+        } else {
+             fprintf(stderr, "Warning: Ignoring extra argument: %s\n", argv[i]);
         }
-    } else {
-         printf("Usage: %s <port>\nUsing default port %d\n", argv[0], DEFAULT_PORT);
     }
 
+    if (!port_set) {
+         printf("Usage: %s [<port>] [--public-ip <ip_address>]\nUsing default port %d\n", argv[0], DEFAULT_PORT);
+    }
 
     // Creating socket file descriptor
     if ((server_fd = socket(AF_INET, SOCK_STREAM, 0)) == 0) {

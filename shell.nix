@@ -6,8 +6,9 @@
 }:
 
 pkgs.mkShell {
-  packages = with pkgs; [ 
+  packages = with pkgs; [
     gcc
     cmake
+    openssl # Add openssl development package
   ];
 }

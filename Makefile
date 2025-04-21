@@ -1,5 +1,6 @@
 CC = gcc
 CFLAGS = -Wall -Wextra -g # -g adds debug symbols
+LDLIBS = -lssl -lcrypto # Add SSL libraries
 BUILD_DIR = build
 
 TARGET_SERVER = $(BUILD_DIR)/server
@@ -10,10 +11,10 @@ SOURCES_CLIENT = client.c
 all: $(TARGET_SERVER) $(TARGET_CLIENT)
 
 $(TARGET_SERVER): $(SOURCES_SERVER) | $(BUILD_DIR)
-	$(CC) $(CFLAGS) -o $@ $<
+	$(CC) $(CFLAGS) -o $@ $< $(LDLIBS)
 
 $(TARGET_CLIENT): $(SOURCES_CLIENT) | $(BUILD_DIR)
-	$(CC) $(CFLAGS) -o $@ $<
+	$(CC) $(CFLAGS) -o $@ $< $(LDLIBS)
 
 # Create the build directory if it doesn't exist
 $(BUILD_DIR):

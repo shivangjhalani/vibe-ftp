@@ -11,6 +11,8 @@
 #include <fcntl.h> // For file operations
 #include <signal.h> // For signal handling
 #include <sys/time.h> // For timeval struct
+#include <openssl/ssl.h> // For SSL
+#include <openssl/err.h> // For SSL error handling
 
 #define BUFFER_SIZE 4096 // Increased buffer for file transfer
 #define MAX_FILENAME_LEN (BUFFER_SIZE - 128) // Increased reserve space
@@ -18,6 +20,32 @@
 
 // Global variable for control socket (for signal handler)
 int g_control_sock = -1;
+SSL *g_control_ssl = NULL; // Global SSL object for control connection
+
+// Forward declarations
+void cleanup_openssl_client();
+
+// Definition for cleanup_openssl_client
+void cleanup_openssl_client() {
+    // Clean up OpenSSL library resources
+    // Note: SSL objects (g_control_ssl, data_ssl) should be freed when their connections close.
+    // The SSL_CTX is typically freed at the very end.
+    // ERR_free_strings(); // Deprecated in OpenSSL 1.1.0+
+    // EVP_cleanup();      // Deprecated in OpenSSL 1.1.0+
+    // SSL_COMP_free_compression_methods(); // If compression was used, also deprecated/handled differently now.
+    // Consider if specific SSL objects need freeing here if not handled elsewhere.
+    // If g_control_ssl is used and needs cleanup here:
+    // if (g_control_ssl) {
+    //     SSL_shutdown(g_control_ssl); // Attempt graceful shutdown
+    //     SSL_free(g_control_ssl);
+    //     g_control_ssl = NULL;
+    // }
+    // The context (ctx) is freed in main after the loop.
+    // If OpenSSL_add_ssl_algorithms() was called, FIPS_mode_set(0) might be needed for cleanup in some contexts.
+    // For modern OpenSSL (1.1.0+), much of the global cleanup is automatic on exit.
+    // This function might be minimal or empty depending on exact OpenSSL version and usage.
+    printf("Performing OpenSSL cleanup (if necessary)...\n");
+}
 
 // Signal handler for SIGINT
 void handle_sigint_client(int sig) {
@@ -56,6 +84,34 @@ int is_path_valid_client(const char *path) {
     }
     // Add other checks if needed
     return 1; // Valid
+}
+
+// Function to create SSL context for client
+SSL_CTX* create_ssl_context_client() {
+    const SSL_METHOD *method;
+    SSL_CTX *ctx;
+
+    method = TLS_client_method(); // Use modern TLS method for client
+
+    ctx = SSL_CTX_new(method);
+    if (!ctx) {
+        perror("Unable to create SSL context");
+        ERR_print_errors_fp(stderr);
+        exit(EXIT_FAILURE);
+    }
+
+    // Enable peer verification
+    SSL_CTX_set_verify(ctx, SSL_VERIFY_PEER, NULL);
+
+    // Load the server's self-signed certificate as the trusted CA
+    if (!SSL_CTX_load_verify_locations(ctx, "server.crt", NULL)) {
+        fprintf(stderr, "Error loading server certificate file (server.crt).\n");
+        ERR_print_errors_fp(stderr);
+        SSL_CTX_free(ctx);
+        exit(EXIT_FAILURE);
+    }
+
+    return ctx;
 }
 
 // Function to handle CLS command
@@ -173,6 +229,76 @@ int connect_to_data_port(const char *ip_addr, int port) {
     return data_sock;
 }
 
+// Helper function to connect to the data port and perform SSL handshake
+SSL* connect_to_data_port_ssl(const char *ip_addr, int port, SSL_CTX *ctx) {
+    int data_sock = 0;
+    struct sockaddr_in data_serv_addr;
+    SSL *data_ssl = NULL;
+
+    if ((data_sock = socket(AF_INET, SOCK_STREAM, 0)) < 0) {
+        perror("Data socket creation error");
+        return NULL;
+    }
+
+    data_serv_addr.sin_family = AF_INET;
+    data_serv_addr.sin_port = htons(port);
+
+    if (inet_pton(AF_INET, ip_addr, &data_serv_addr.sin_addr) <= 0) {
+        perror("Invalid data address/ Address not supported");
+        close(data_sock);
+        return NULL;
+    }
+
+    printf("Connecting to data port %s:%d...\n", ip_addr, port);
+    if (connect(data_sock, (struct sockaddr *)&data_serv_addr, sizeof(data_serv_addr)) < 0) {
+        perror("Data connection Failed");
+        close(data_sock);
+        return NULL;
+    }
+
+    // Set timeouts for the data socket
+    if (set_socket_timeouts_client(data_sock) < 0) {
+        fprintf(stderr, "Failed to set timeouts for data socket\n");
+        close(data_sock);
+        return NULL;
+    }
+
+    // Create SSL object and associate with the socket
+    data_ssl = SSL_new(ctx);
+    if (!data_ssl) {
+        perror("Unable to create SSL object for data connection");
+        ERR_print_errors_fp(stderr);
+        close(data_sock);
+        return NULL;
+    }
+
+    SSL_set_fd(data_ssl, data_sock);
+
+    // Perform SSL handshake
+    if (SSL_connect(data_ssl) <= 0) {
+        perror("Data SSL handshake failed");
+        ERR_print_errors_fp(stderr);
+        SSL_free(data_ssl);
+        close(data_sock);
+        return NULL;
+    }
+    printf("Data SSL handshake successful.\n");
+
+    // Verify server certificate after handshake
+    long verify_result = SSL_get_verify_result(data_ssl);
+    if (verify_result != X509_V_OK) {
+        fprintf(stderr, "Data connection certificate verification failed: %s\n", X509_verify_cert_error_string(verify_result));
+        // Handle verification failure (e.g., close connection)
+        SSL_shutdown(data_ssl);
+        SSL_free(data_ssl);
+        close(data_sock);
+        return NULL;
+    }
+    printf("Data connection certificate verified successfully.\n");
+
+    return data_ssl; // Return SSL object (socket fd is managed by SSL object)
+}
+
 int main(int argc, char *argv[]) {
     int control_sock = 0;
     struct sockaddr_in serv_addr;
@@ -180,6 +306,8 @@ int main(int argc, char *argv[]) {
     char command[BUFFER_SIZE] = {0};
     char user_input[BUFFER_SIZE] = {0};
     char server_ip_arg[INET_ADDRSTRLEN]; // Store original server IP
+    SSL_CTX *ctx = NULL;
+    SSL *ssl = NULL;
 
     // Setup signal handling
     signal(SIGINT, handle_sigint_client);
@@ -197,9 +325,18 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
+    // Initialize OpenSSL
+    SSL_library_init();
+    SSL_load_error_strings();
+    OpenSSL_add_ssl_algorithms();
+
+    // Create SSL context
+    ctx = create_ssl_context_client();
+
     // Create socket
     if ((control_sock = socket(AF_INET, SOCK_STREAM, 0)) < 0) {
         perror("Socket creation error");
+        SSL_CTX_free(ctx);
         return 1;
     }
     g_control_sock = control_sock; // Store globally for signal handler
@@ -212,6 +349,7 @@ int main(int argc, char *argv[]) {
         perror("Invalid address/ Address not supported");
         close(control_sock);
         g_control_sock = -1;
+        SSL_CTX_free(ctx);
         return 1;
     }
 
@@ -220,14 +358,55 @@ int main(int argc, char *argv[]) {
         perror("Connection Failed");
         close(control_sock);
         g_control_sock = -1;
+        SSL_CTX_free(ctx);
         return 1;
     }
+
+    // Create SSL object and associate with the socket
+    ssl = SSL_new(ctx);
+    if (!ssl) {
+        perror("Unable to create SSL object for control connection");
+        ERR_print_errors_fp(stderr);
+        close(control_sock);
+        g_control_sock = -1;
+        SSL_CTX_free(ctx);
+        return 1;
+    }
+
+    SSL_set_fd(ssl, control_sock);
+
+    // Perform SSL handshake
+    if (SSL_connect(ssl) <= 0) {
+        perror("Control SSL handshake failed");
+        ERR_print_errors_fp(stderr);
+        SSL_free(ssl);
+        close(control_sock);
+        g_control_sock = -1;
+        SSL_CTX_free(ctx);
+        return 1;
+    }
+    printf("SSL handshake successful with server %s:%d\n", server_ip, port);
+
+    // Verify server certificate after handshake
+    long verify_result = SSL_get_verify_result(ssl);
+    if (verify_result != X509_V_OK) {
+        fprintf(stderr, "Control connection certificate verification failed: %s\n", X509_verify_cert_error_string(verify_result));
+        // Handle verification failure
+        SSL_shutdown(ssl); SSL_free(ssl); g_control_ssl = NULL;
+        close(control_sock); g_control_sock = -1;
+        SSL_CTX_free(ctx);
+        cleanup_openssl_client();
+        return 1;
+    }
+    printf("Control connection certificate verified successfully.\n");
 
     // Set timeouts for the control socket
     if (set_socket_timeouts_client(control_sock) < 0) {
         fprintf(stderr, "Failed to set timeouts for control socket\n");
-        close(control_sock);
-        g_control_sock = -1;
+        SSL_shutdown(ssl); SSL_free(ssl); g_control_ssl = NULL;
+        close(control_sock); g_control_sock = -1;
+        SSL_CTX_free(ctx);
+        cleanup_openssl_client();
         return 1;
     }
 
@@ -285,61 +464,82 @@ int main(int argc, char *argv[]) {
                 continue;
             }
 
-            // Send UP command to server
+            // Send UP command to server using SSL
             snprintf(command, sizeof(command), "UP %s\r\n", filename);
-            if (send(control_sock, command, strlen(command), 0) < 0) {
-                perror("Send UP command failed");
+            if (SSL_write(ssl, command, strlen(command)) <= 0) { // NEW: Use SSL_write
+                perror("SSL_write UP command failed");
+                ERR_print_errors_fp(stderr); // Print SSL errors
                 fclose(fp);
                 break;
             }
 
-            // Receive response (expect 227)
-            int n = recv(control_sock, buffer, BUFFER_SIZE - 1, 0);
-            if (n <= 0) { /* Handle error/disconnect */ break; }
+            // Receive response (expect 227) using SSL
+            int n = SSL_read(ssl, buffer, BUFFER_SIZE - 1); // NEW: Use SSL_read
+            if (n <= 0) {
+                 fprintf(stderr, "SSL_read failed after UP command (error code: %d)\n", SSL_get_error(ssl, n));
+                 ERR_print_errors_fp(stderr);
+                 fclose(fp);
+                 break;
+            }
             buffer[n] = '\0';
             printf("%s", buffer);
 
             if (strncmp(buffer, "227", 3) == 0) {
                 char data_ip[INET_ADDRSTRLEN];
                 int data_port;
-                // Use server_ip_arg for simplicity, though parsing buffer is more robust
                 if (parse_pasv_response(buffer, data_ip, &data_port) == 0) {
-                    int data_sock = connect_to_data_port(data_ip, data_port);
-                    if (data_sock >= 0) {
-                        // Receive next response (expect 150)
-                        n = recv(control_sock, buffer, BUFFER_SIZE - 1, 0);
-                        if (n <= 0) { /* Handle error/disconnect */ close(data_sock); break; }
+                    SSL *data_ssl = connect_to_data_port_ssl(data_ip, data_port, ctx); // NEW: Use SSL version
+                    if (data_ssl != NULL) { // NEW: Check SSL object
+                        // Receive next response (expect 150) using control SSL
+                        n = SSL_read(ssl, buffer, BUFFER_SIZE - 1); // NEW: Use SSL_read
+                        if (n <= 0) {
+                             fprintf(stderr, "SSL_read failed waiting for 150 (error code: %d)\n", SSL_get_error(ssl, n));
+                             ERR_print_errors_fp(stderr);
+                             SSL_shutdown(data_ssl); SSL_free(data_ssl); // close(data_sock); // OLD
+                             break;
+                        }
                         buffer[n] = '\0';
                         printf("%s", buffer);
 
                         if (strncmp(buffer, "150", 3) == 0) {
-                            // Send file data
+                            // Send file data using data SSL
                             ssize_t bytes_read, bytes_sent;
                             while ((bytes_read = fread(buffer, 1, BUFFER_SIZE, fp)) > 0) {
-                                bytes_sent = send(data_sock, buffer, bytes_read, 0);
-                                if (bytes_sent < 0) {
-                                    perror("Send data failed");
+                                bytes_sent = SSL_write(data_ssl, buffer, bytes_read); // NEW: Use SSL_write
+                                if (bytes_sent <= 0) {
+                                    fprintf(stderr, "SSL_write data failed (code: %d)\n", SSL_get_error(data_ssl, bytes_sent));
+                                    ERR_print_errors_fp(stderr);
                                     break;
                                 }
-                                if (bytes_sent < bytes_read) {
-                                     fprintf(stderr, "Warning: Partial send during upload.\n");
-                                     break; // Simplistic handling
-                                }
+                                // Note: SSL_write might send less than requested, proper handling would loop
+                                // if (bytes_sent < bytes_read) { ... }
                             }
                             if (ferror(fp)) {
                                 perror("Local file read error");
                             }
-                            printf("File transfer initiated...\n");
+                            printf("File transfer initiated (SSL)...\n");
                         }
-                        close(data_sock); // Close data connection after sending
+                        SSL_shutdown(data_ssl); // NEW: Initiate SSL shutdown
+                        SSL_free(data_ssl);     // NEW: Free SSL object (closes underlying socket)
 
-                        // Receive final response (expect 226)
-                        n = recv(control_sock, buffer, BUFFER_SIZE - 1, 0);
-                        if (n <= 0) { /* Handle error/disconnect */ break; }
+                        // Receive final response (expect 226) using control SSL
+                        n = SSL_read(ssl, buffer, BUFFER_SIZE - 1); // NEW: Use SSL_read
+                        if (n <= 0) {
+                             fprintf(stderr, "SSL_read failed waiting for 226 (error code: %d)\n", SSL_get_error(ssl, n));
+                             ERR_print_errors_fp(stderr);
+                             break;
+                        }
                         buffer[n] = '\0';
                         printf("%s", buffer);
+                    } else { // Handle data_ssl connection failure
+                         fprintf(stderr, "Failed to establish SSL data connection.\n");
+                         // Server might still be waiting, maybe send ABOR? For now, just continue.
                     }
+                } else { // Handle PASV parse failure
+                     fprintf(stderr, "Failed to parse PASV response for UP.\n");
                 }
+            } else { // Handle non-227 response
+                 fprintf(stderr, "Server did not enter passive mode for UP.\n");
             }
             fclose(fp);
             printf("ftp> ");
@@ -359,16 +559,21 @@ int main(int argc, char *argv[]) {
                 continue;
             }
 
-            // Send DOWN command to server
+            // Send DOWN command to server using SSL
             snprintf(command, sizeof(command), "DOWN %s\r\n", filename);
-            if (send(control_sock, command, strlen(command), 0) < 0) {
-                perror("Send DOWN command failed");
+            if (SSL_write(ssl, command, strlen(command)) <= 0) { // NEW: Use SSL_write
+                perror("SSL_write DOWN command failed");
+                ERR_print_errors_fp(stderr);
                 break;
             }
 
-            // Receive response (expect 227 or 550)
-            int n = recv(control_sock, buffer, BUFFER_SIZE - 1, 0);
-            if (n <= 0) { /* Handle error/disconnect */ break; }
+            // Receive response (expect 227 or 550) using SSL
+            int n = SSL_read(ssl, buffer, BUFFER_SIZE - 1); // NEW: Use SSL_read
+            if (n <= 0) {
+                 fprintf(stderr, "SSL_read failed after DOWN command (error code: %d)\n", SSL_get_error(ssl, n));
+                 ERR_print_errors_fp(stderr);
+                 break;
+            }
             buffer[n] = '\0';
             printf("%s", buffer);
 
@@ -376,11 +581,16 @@ int main(int argc, char *argv[]) {
                 char data_ip[INET_ADDRSTRLEN];
                 int data_port;
                 if (parse_pasv_response(buffer, data_ip, &data_port) == 0) {
-                    int data_sock = connect_to_data_port(data_ip, data_port);
-                    if (data_sock >= 0) {
-                        // Receive next response (expect 150)
-                        n = recv(control_sock, buffer, BUFFER_SIZE - 1, 0);
-                        if (n <= 0) { /* Handle error/disconnect */ close(data_sock); break; }
+                    SSL *data_ssl = connect_to_data_port_ssl(data_ip, data_port, ctx); // NEW: Use SSL version
+                    if (data_ssl != NULL) { // NEW: Check SSL object
+                        // Receive next response (expect 150) using control SSL
+                        n = SSL_read(ssl, buffer, BUFFER_SIZE - 1); // NEW: Use SSL_read
+                        if (n <= 0) {
+                             fprintf(stderr, "SSL_read failed waiting for 150 (error code: %d)\n", SSL_get_error(ssl, n));
+                             ERR_print_errors_fp(stderr);
+                             SSL_shutdown(data_ssl); SSL_free(data_ssl); // close(data_sock); // OLD
+                             break;
+                        }
                         buffer[n] = '\0';
                         printf("%s", buffer);
 
@@ -389,28 +599,48 @@ int main(int argc, char *argv[]) {
                             if (!fp) {
                                 perror("Local file open failed for writing");
                                 // How to notify server? Not easy in basic FTP without ABOR
+                                // Close data connection gracefully anyway
+                                SSL_shutdown(data_ssl); SSL_free(data_ssl); // close(data_sock); // OLD
                             } else {
-                                // Receive file data
+                                // Receive file data using data SSL
                                 ssize_t bytes_received;
-                                while ((bytes_received = recv(data_sock, buffer, BUFFER_SIZE, 0)) > 0) {
+                                while ((bytes_received = SSL_read(data_ssl, buffer, BUFFER_SIZE)) > 0) { // NEW: Use SSL_read
                                     fwrite(buffer, 1, bytes_received, fp);
                                 }
-                                if (bytes_received < 0) {
-                                    perror("Recv data failed");
+                                // Check SSL_read error status
+                                int ssl_error = SSL_get_error(data_ssl, bytes_received);
+                                if (ssl_error != SSL_ERROR_ZERO_RETURN && ssl_error != SSL_ERROR_NONE) {
+                                     fprintf(stderr, "SSL_read data failed (code: %d)\n", ssl_error);
+                                     ERR_print_errors_fp(stderr);
+                                     // File might be incomplete
                                 }
                                 fclose(fp);
-                                printf("File transfer initiated...\n");
+                                printf("File transfer initiated (SSL)...\n");
                             }
                         }
-                        close(data_sock); // Close data connection after receiving
+                        SSL_shutdown(data_ssl); // NEW: Initiate SSL shutdown
+                        SSL_free(data_ssl);     // NEW: Free SSL object
 
-                        // Receive final response (expect 226)
-                        n = recv(control_sock, buffer, BUFFER_SIZE - 1, 0);
-                        if (n <= 0) { /* Handle error/disconnect */ break; }
+                        // Receive final response (expect 226) using control SSL
+                        n = SSL_read(ssl, buffer, BUFFER_SIZE - 1); // NEW: Use SSL_read
+                        if (n <= 0) {
+                             fprintf(stderr, "SSL_read failed waiting for 226 (error code: %d)\n", SSL_get_error(ssl, n));
+                             ERR_print_errors_fp(stderr);
+                             break;
+                        }
                         buffer[n] = '\0';
                         printf("%s", buffer);
+                    } else { // Handle data_ssl connection failure
+                         fprintf(stderr, "Failed to establish SSL data connection.\n");
                     }
+                } else { // Handle PASV parse failure
+                     fprintf(stderr, "Failed to parse PASV response for DOWN.\n");
                 }
+            } else if (strncmp(buffer, "550", 3) == 0) {
+                 // Server reported file not found or other error, no data connection expected.
+                 fprintf(stderr, "Server reported error: %s", buffer); // Print the 550 message
+            } else {
+                 fprintf(stderr, "Unexpected response after DOWN command: %s", buffer);
             }
             printf("ftp> ");
             continue;
@@ -426,48 +656,71 @@ int main(int argc, char *argv[]) {
         command[sizeof(command) - 3] = '\0'; // Ensure null termination if strncpy truncated
         strcat(command, "\r\n");
 
-        // Send command to server
-        if (send(control_sock, command, strlen(command), 0) < 0) {
-            if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                 fprintf(stderr, "Error: Send timeout occurred.\n");
-                 // Optionally break or retry
+        // Send command to server using SSL
+        if (SSL_write(ssl, command, strlen(command)) <= 0) { // NEW: Use SSL_write
+            int ssl_error = SSL_get_error(ssl, -1); // Use -1 as SSL_write returns <= 0 on error
+            if (ssl_error == SSL_ERROR_SYSCALL) {
+                 if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                     fprintf(stderr, "Error: SSL_write timeout occurred.\n");
+                 } else {
+                     perror("SSL_write failed (SYSCALL)");
+                 }
             } else {
-                perror("Send failed");
+                fprintf(stderr, "SSL_write failed (error code: %d)\n", ssl_error);
+                ERR_print_errors_fp(stderr);
             }
             break;
         }
 
-        // Receive response from server
-        int n = recv(control_sock, buffer, BUFFER_SIZE - 1, 0);
-        if (n < 0) {
-            if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                 fprintf(stderr, "Error: Receive timeout occurred.\n");
-                 // Optionally break or retry
+        // Receive response from server using SSL
+        int n = SSL_read(ssl, buffer, BUFFER_SIZE - 1); // NEW: Use SSL_read
+        if (n <= 0) {
+            int ssl_error = SSL_get_error(ssl, n);
+            if (ssl_error == SSL_ERROR_ZERO_RETURN) {
+                printf("Server closed SSL connection gracefully.\n");
+            } else if (ssl_error == SSL_ERROR_SYSCALL) {
+                 if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                     fprintf(stderr, "Error: SSL_read timeout occurred.\n");
+                 } else if (n == 0) { // Check underlying socket EOF
+                     printf("Server disconnected abruptly (socket closed).\n");
+                 } else {
+                     perror("SSL_read failed (SYSCALL)");
+                 }
             } else {
-                perror("Recv failed");
+                fprintf(stderr, "SSL_read failed (error code: %d)\n", ssl_error);
+                ERR_print_errors_fp(stderr);
             }
-            break;
-        } else if (n == 0) {
-            printf("Server closed connection.\n");
             break;
         }
 
         buffer[n] = '\0';
-        printf("%s", buffer); // Print server response (includes \r\n)
+        printf("%s", buffer); // Print server response
 
-        // Check if the command was QUIT and server responded appropriately (e.g., 221)
-        // A more robust check would parse the response code.
+        // Check if the command was QUIT and server responded appropriately
         if (strncmp(command, "QUIT", 4) == 0 && strncmp(buffer, "221", 3) == 0) {
             break; // Exit loop after QUIT acknowledged
         }
          printf("ftp> ");
     }
 
-    // Close the control socket
-    if (g_control_sock != -1) {
-        close(g_control_sock);
+    // Clean up SSL connection before closing socket
+    if (ssl) {
+        SSL_shutdown(ssl); // Initiate SSL shutdown
+        SSL_free(ssl);
+        g_control_ssl = NULL; // Clear global pointer if used
     }
+
+    // Close the control socket (already done by SSL_free)
+    // if (g_control_sock != -1) {
+    //     close(g_control_sock);
+    // }
     printf("Connection closed.\n");
+
+    // Clean up SSL context
+    if (ctx) {
+        SSL_CTX_free(ctx);
+    }
+    cleanup_openssl_client(); // Call general OpenSSL cleanup if needed
 
     return 0;
 }
